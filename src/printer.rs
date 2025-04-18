@@ -53,8 +53,8 @@ struct Printer {
     log: File,
 }
 
-#[pymethods]
-impl Printer {
-    #[new]
-    pub fn new(log_filepath: String) -> Self {}
-}
+// #[pymethods]
+// impl Printer {
+//     #[new]
+//     pub fn new(log_filepath: String) -> Self {}
+// }
