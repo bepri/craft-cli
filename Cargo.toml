@@ -10,4 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 jiff = "0.2.8"
+lazy_static = "1.5.0"
 pyo3 = "0.24.0"
+ratatui = "0.29.0"
+termsize = "0.1.9"

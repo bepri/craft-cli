@@ -1,6 +1,7 @@
 use pyo3::{prelude::*, pymodule};
 
 mod craft_cli_utils;
+mod prelude;
 mod printer;
 mod utils;
 
@@ -22,6 +23,9 @@ mod _rs {
 
     #[pymodule_export]
     use crate::craft_cli_utils::utils;
+
+    #[pymodule_export]
+    use crate::printer::printer;
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
