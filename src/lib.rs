@@ -1,7 +1,6 @@
 use pyo3::{prelude::*, pymodule};
 
 mod craft_cli_utils;
-mod prelude;
 mod printer;
 mod utils;
 
