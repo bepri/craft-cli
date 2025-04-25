@@ -31,6 +31,7 @@ const EXPECT_NO_POISON: &str =
 struct Spinner {}
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug))]
 struct FileHandle(Option<Arc<Mutex<File>>>);
 
 impl FileHandle {
@@ -478,5 +479,54 @@ pub mod printer {
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
         fix_imports(m, "craft_cli._rs.printer")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests;
+
+    mod file_handle {
+        use std::path::Path;
+
+        use tempdir::TempDir;
+
+        use super::*;
+
+        fn get_temp_dir() -> PathBuf {
+            TempDir::new("test_file_handle")
+                .expect("Could not create temporary directory")
+                .into_path()
+        }
+
+        fn build_file(base: &Path, name: &str) -> FileHandle {
+            let file_path = base.join(name);
+            let file = File::options()
+                .create_new(true)
+                .write(true)
+                .open(file_path)
+                .expect("Could not create temporary file");
+
+            FileHandle(Some(Arc::new(Mutex::new(file))))
+        }
+
+        #[test]
+        fn test_eq() {
+            let temp_dir = get_temp_dir();
+            let lhs = build_file(&temp_dir, "file1.txt");
+            let rhs = lhs.clone();
+
+            assert_eq!(lhs, rhs);
+        }
+
+        #[test]
+        fn test_ne() {
+            let temp_dir = get_temp_dir();
+            let lhs = build_file(&temp_dir, "file1.txt");
+            let rhs = build_file(&temp_dir, "file2.txt");
+
+            assert_ne!(lhs, rhs);
+        }
     }
 }

@@ -2,6 +2,7 @@ use pyo3::{prelude::*, pymodule};
 
 mod craft_cli_utils;
 mod printer;
+mod tests;
 mod utils;
 
 /// Formats the sum of two numbers as string.
