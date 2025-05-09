@@ -24,3 +24,31 @@ where
         assert!(re.is_match(&value))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::exceptions::PyValueError;
+
+    mod assert_error_type {
+        use super::*;
+
+        #[test]
+        fn basic() {
+            let err = PyValueError::new_err("Oh no!");
+
+            assert_error_type::<PyValueError>(&err);
+        }
+    }
+
+    mod assert_error_contents {
+        use super::*;
+
+        #[test]
+        fn basic() {
+            let err = PyValueError::new_err("Oh no!");
+
+            assert_error_contents(&err, "Oh no!");
+        }
+    }
+}

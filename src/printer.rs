@@ -3,17 +3,25 @@
 use std::{
     fmt::Display,
     fs::File,
-    io::Write,
+    hint,
+    io::{IsTerminal, Write},
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex, OnceLock, RwLock, RwLockReadGuard,
+    },
+    thread::{self, JoinHandle, Thread},
+    time::Duration,
 };
 
 use jiff::Timestamp;
 use lazy_static::lazy_static;
 use pyo3::{
-    exceptions::PyOSError, pyclass, pymethods, pymodule, types::PyAnyMethods, FromPyObject,
-    PyResult,
+    exceptions::{PyOSError, PyRuntimeError},
+    pyclass, pymethods, pymodule,
+    types::PyAnyMethods,
+    FromPyObject, PyResult,
 };
 
 use crate::utils::get_substring;
@@ -28,8 +36,121 @@ const ANSI_SHOW_CURSOR: &str = "\u{001b}[?25h";
 const EXPECT_NO_POISON: &str =
     "Only fails if a panic occurs in another thread, which would be irrecoverable anyways.";
 
-struct Spinner {}
+struct Spinner {
+    sender: Sender<Option<MessageInfo>>,
+    receiver: Mutex<Receiver<Option<MessageInfo>>>,
+    lock: Mutex<()>,
+    under_supervision: Option<MessageInfo>,
+    thread_handle: Option<JoinHandle<()>>,
+}
 
+impl Spinner {
+    pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver: Mutex::new(receiver),
+            lock: Mutex::new(()),
+            under_supervision: None,
+            thread_handle: None,
+        }
+    }
+
+    pub fn run<'sf, SF: FnMut(&mut MessageInfo, &str) -> PyResult<()> + Send>(
+        &mut self,
+        mut spin_func: SF,
+    ) -> PyResult<()> {
+        // thread::spawn(|| self.thread_closure(&'sf mut spin_func));
+        Ok(())
+    }
+
+    fn thread_closure<SF: FnMut(&mut MessageInfo, &str) -> PyResult<()> + Send>(
+        &mut self,
+        mut spin_func: SF,
+    ) -> PyResult<()> {
+        let mut prv_msg: Option<MessageInfo> = None;
+        const SPINCHARS: [char; 4] = ['-', '\\', '|', '/'];
+        let receiver = self.receiver.get_mut().expect(EXPECT_NO_POISON);
+
+        loop {
+            let t_init = Timestamp::now();
+            let new_msg = match receiver.recv_timeout(Duration::from_secs_f32(SPINNER_THRESHHOLD)) {
+                Err(_) => {
+                    return Err(PyRuntimeError::new_err(
+                        "Internal error: spin queue sender was closed early",
+                    ));
+                }
+                Ok(Some(msg)) => msg,
+                Ok(None) => {
+                    // We waited too much, start to show a spinner (if we have a message to spin)
+                    // until we have more info
+                    if prv_msg.as_ref().is_none_or(|msg| msg.end_line) {
+                        continue;
+                    }
+
+                    let mut spin_it = SPINCHARS.iter().cycle();
+
+                    // Open a new scope to hold the lock
+                    {
+                        let _lock = self.lock.lock().expect(EXPECT_NO_POISON);
+
+                        loop {
+                            let t_delta = Timestamp::now() - t_init;
+                            let spintext = format!(
+                                " {} {:.1}",
+                                spin_it
+                                    .next()
+                                    .expect("Cyclic iterator - will always yield more."),
+                                t_delta
+                            );
+                            spin_func(
+                                prv_msg.as_mut().expect("Checked earlier in the function"),
+                                &spintext,
+                            )?;
+
+                            match receiver.recv_timeout(Duration::from_secs_f32(SPINNER_DELAY)) {
+                                Err(_) => {
+                                    return Err(PyRuntimeError::new_err(
+                                        "Internal error: spin queue sender was closed early",
+                                    ));
+                                }
+                                Ok(Some(msg)) => break msg,
+                                Ok(None) => continue,
+                            }
+                        }
+                    }
+                }
+            };
+
+            prv_msg = Some(new_msg);
+            if prv_msg.is_none() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Supervise a message to spin it if it remains too long.
+    fn supervise(&mut self, message: MessageInfo) {
+        if Some(&message) == self.under_supervision.as_ref() {
+            return;
+        }
+
+        self.under_supervision = Some(message.clone());
+        self.sender.send(Some(message));
+        self.lock.lock().expect(EXPECT_NO_POISON);
+    }
+
+    pub fn stop(&mut self) {
+        self.sender.send(None);
+        if let Some(handle) = self.thread_handle.take() {
+            handle.join();
+        }
+    }
+}
+
+#[repr(transparent)]
 #[derive(Clone)]
 #[cfg_attr(test, derive(Debug))]
 struct FileHandle(Option<Arc<Mutex<File>>>);
@@ -46,9 +167,9 @@ impl FileHandle {
         }
     }
 
-    pub fn write<S>(&mut self, message: S) -> PyResult<()>
+    pub fn write<AnyStr>(&mut self, message: AnyStr) -> PyResult<()>
     where
-        S: AsRef<[u8]>,
+        AnyStr: AsRef<[u8]>,
     {
         if let Some(ref mut stream_lock) = self.0 {
             let mut stream = stream_lock.lock().expect(EXPECT_NO_POISON);
@@ -69,6 +190,16 @@ impl FileHandle {
 
     pub fn is_writable(&self) -> bool {
         self.0.is_some()
+    }
+
+    pub fn is_tty(&self) -> bool {
+        match self.0 {
+            Some(ref stream_lock) => {
+                let stream = stream_lock.lock().expect(EXPECT_NO_POISON);
+                stream.is_terminal()
+            }
+            None => false,
+        }
     }
 }
 
@@ -105,7 +236,8 @@ impl Drop for FileHandle {
     }
 }
 
-#[derive(Clone)]
+#[repr(transparent)]
+#[derive(Clone, Default)]
 struct TermPrefix(Arc<RwLock<String>>);
 
 impl TermPrefix {
@@ -131,12 +263,12 @@ impl PartialEq for TermPrefix {
     }
 }
 
-impl<S> PartialEq<S> for TermPrefix
+impl<AnyStr> PartialEq<AnyStr> for TermPrefix
 where
-    S: AsRef<str>,
+    AnyStr: AsRef<[u8]>,
 {
-    fn eq(&self, other: &S) -> bool {
-        self.read().as_str() == other.as_ref()
+    fn eq(&self, other: &AnyStr) -> bool {
+        AsRef::<[u8]>::as_ref(&self.read().as_str()) == other.as_ref()
     }
 }
 
@@ -166,7 +298,9 @@ struct Printer {
     log: File,
     terminal_prefix: TermPrefix,
     secrets: Vec<String>,
-    spinner: Spinner,
+    spin_lock: Arc<Mutex<()>>,
+    spin_thread_handle: OnceLock<JoinHandle<PyResult<()>>>,
+    spin_thread_sender: Option<Sender<Option<MessageInfo>>>,
 }
 
 #[pymethods]
@@ -184,12 +318,14 @@ impl Printer {
         };
 
         Ok(Self {
-            stopped: false,
-            prv_msg: None,
             log,
-            terminal_prefix: TermPrefix::new(""),
-            secrets: Vec::new(),
-            spinner: Spinner {},
+            stopped: Default::default(),
+            prv_msg: Default::default(),
+            terminal_prefix: Default::default(),
+            secrets: Default::default(),
+            spin_lock: Default::default(),
+            spin_thread_handle: Default::default(),
+            spin_thread_sender: Default::default(),
         })
     }
 
@@ -276,7 +412,7 @@ impl Printer {
     }
 
     /// Write a simple line message to the screen.
-    fn write_line_terminal(&mut self, message: &mut MessageInfo, spintext: String) -> PyResult<()> {
+    fn write_line_terminal(&mut self, message: &mut MessageInfo, spintext: &str) -> PyResult<()> {
         // Prepare the text with (maybe) the timestamp and remove trailing spaces
         let mut text = self.get_prefixed_message_text(message).trim_end().into();
 
@@ -395,6 +531,96 @@ impl Printer {
         Ok(())
     }
 
+    fn spin(&mut self, message: &mut MessageInfo, spintext: &str) -> PyResult<()> {
+        if message.stream.is_tty() {
+            self.write_line_terminal(message, spintext)?;
+        }
+
+        Ok(())
+    }
+
+    fn supervise(&mut self, shared_self: Arc<Mutex<Self>>, message: Option<MessageInfo>) {
+        self.spin_thread_handle.get_or_init(|| {
+            let (sender, receiver) = mpsc::channel();
+            let lock = self.spin_lock.clone();
+            self.spin_thread_sender = Some(sender);
+            thread::spawn(|| Self::thread_closure(shared_self, receiver, lock))
+        });
+
+        self.spin_thread_sender
+            .as_mut()
+            .expect("Always initialized above")
+            .send(message);
+    }
+
+    fn thread_closure(
+        printer: Arc<Mutex<Self>>,
+        receiver: Receiver<Option<MessageInfo>>,
+        spin_lock: Arc<Mutex<()>>,
+    ) -> PyResult<()> {
+        let mut prv_msg: Option<MessageInfo> = None;
+        const SPINCHARS: [char; 4] = ['-', '\\', '|', '/'];
+        let mut printer = printer.lock().expect(EXPECT_NO_POISON);
+
+        loop {
+            let t_init = Timestamp::now();
+            let new_msg = match receiver.recv_timeout(Duration::from_secs_f32(SPINNER_THRESHHOLD)) {
+                Err(_) => {
+                    return Err(PyRuntimeError::new_err(
+                        "Internal error: spin queue sender was closed early",
+                    ));
+                }
+                Ok(Some(msg)) => msg,
+                Ok(None) => {
+                    // We waited too much, start to show a spinner (if we have a message to spin)
+                    // until we have more info
+                    if prv_msg.as_ref().is_none_or(|msg| msg.end_line) {
+                        continue;
+                    }
+
+                    let mut spin_it = SPINCHARS.iter().cycle();
+
+                    // Open a new scope to hold the lock
+                    {
+                        let _lock = spin_lock.lock().expect(EXPECT_NO_POISON);
+
+                        loop {
+                            let t_delta = Timestamp::now() - t_init;
+                            let spintext = format!(
+                                " {} {:.1}",
+                                spin_it
+                                    .next()
+                                    .expect("Cyclic iterator - will always yield more."),
+                                t_delta
+                            );
+                            printer.spin(
+                                prv_msg.as_mut().expect("Checked earlier in the function"),
+                                &spintext,
+                            )?;
+
+                            match receiver.recv_timeout(Duration::from_secs_f32(SPINNER_DELAY)) {
+                                Err(_) => {
+                                    return Err(PyRuntimeError::new_err(
+                                        "Internal error: spin queue sender was closed early",
+                                    ));
+                                }
+                                Ok(Some(msg)) => break msg,
+                                Ok(None) => continue,
+                            }
+                        }
+                    }
+                }
+            };
+
+            prv_msg = Some(new_msg);
+            if prv_msg.is_none() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     fn get_terminal_width() -> usize {
         termsize::get().map(|sizes| sizes.cols).unwrap_or(80).into()
     }
@@ -403,7 +629,7 @@ impl Printer {
     fn format_term_line(
         previous_line_end: &str,
         mut text: String,
-        spintext: String,
+        spintext: &str,
         ephemeral: bool,
     ) -> PyResult<String> {
         let width = Self::get_terminal_width();
@@ -485,10 +711,10 @@ pub mod printer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests;
+    use crate::test_utils;
 
     mod file_handle {
-        use std::path::Path;
+        use std::{fs, path::Path};
 
         use tempdir::TempDir;
 
@@ -500,33 +726,44 @@ mod tests {
                 .into_path()
         }
 
-        fn build_file(base: &Path, name: &str) -> FileHandle {
-            let file_path = base.join(name);
+        fn build_file(path: &Path) -> FileHandle {
             let file = File::options()
                 .create_new(true)
                 .write(true)
-                .open(file_path)
+                .open(path)
                 .expect("Could not create temporary file");
 
             FileHandle(Some(Arc::new(Mutex::new(file))))
         }
 
         #[test]
-        fn test_eq() {
+        fn eq() {
             let temp_dir = get_temp_dir();
-            let lhs = build_file(&temp_dir, "file1.txt");
+            let lhs = build_file(&temp_dir.join("file1.txt"));
             let rhs = lhs.clone();
 
             assert_eq!(lhs, rhs);
         }
 
         #[test]
-        fn test_ne() {
+        fn ne() {
             let temp_dir = get_temp_dir();
-            let lhs = build_file(&temp_dir, "file1.txt");
-            let rhs = build_file(&temp_dir, "file2.txt");
+            let lhs = build_file(&temp_dir.join("file1.txt"));
+            let rhs = build_file(&temp_dir.join("file2.txt"));
 
             assert_ne!(lhs, rhs);
+        }
+
+        #[test]
+        fn write() {
+            let file_path = get_temp_dir().join("file.txt");
+            let mut file_handle = build_file(&file_path);
+
+            file_handle.write("🦀").unwrap();
+
+            let file_contents = fs::read(file_path).unwrap();
+
+            assert_eq!(file_contents, "🦀".as_bytes())
         }
     }
 }

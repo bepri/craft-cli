@@ -36,14 +36,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests;
+    use crate::test_utils;
 
     mod get_substring {
         use super::*;
 
         #[test]
         /// Ensure basic functionality with multiple string types
-        fn test_basic() {
+        fn basic() {
             let string = String::from("Hello world!");
             let string_ref = &string;
             let str_ref = string.as_str();
@@ -55,15 +55,15 @@ mod tests {
 
         #[test]
         /// Check that invalid ranges aren't supported
-        fn test_errors() {
+        fn errors() {
             let string = String::from("Hello world!");
 
             #[allow(clippy::reversed_empty_ranges)]
             let err = get_substring(&string, 1..0)
                 .expect_err("An error should be raised for bad ranges.");
 
-            tests::assert_error_type::<PyValueError>(&err);
-            tests::assert_error_contents(&err, r"Invalid range: start must be <= end\.");
+            test_utils::assert_error_type::<PyValueError>(&err);
+            test_utils::assert_error_contents(&err, r"Invalid range: start must be <= end\.");
         }
     }
 }
