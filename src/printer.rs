@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pyo3::{pyclass, pymethods, pymodule, PyErr, PyResult};
+use pyo3::{pyclass, pymethods, pymodule, sync::GILOnceCell, PyErr, PyResult, Python};
 
 const ANSI_CLEAR_LINE_TO_END: &str = "\u{001b}[K";
 const ANSI_HIDE_CURSOR: &str = "\u{001b}[?25l";
@@ -208,29 +208,28 @@ impl<'locks> Drop for InnerPrinter<'locks> {
 
 /// Public API for printing. Stores a handle to the thread that `InnerPrinter` is
 /// printing from, and a channel to send messages.
+#[derive(Default)]
 #[pyclass]
 pub struct Printer {
-    handle: Option<JoinHandle<PyResult<()>>>,
-    channel: Option<mpsc::Sender<Message>>,
+    handle: GILOnceCell<JoinHandle<PyResult<()>>>,
+    channel: GILOnceCell<mpsc::Sender<Message>>,
 }
 
 #[pymethods]
 impl Printer {
     #[new]
     pub fn new() -> Self {
-        Self {
-            handle: None,
-            channel: None,
-        }
+        Self::default()
     }
 
     /// Spawn a thread to begin listening for messages to print.
-    pub fn start(&mut self, mode: Mode) {
-        if self.handle.is_some() {
+    #[pyo3(signature = (mode))]
+    pub fn start(&mut self, py: Python<'_>, mode: Mode) {
+        let (send, recv) = mpsc::channel();
+
+        if let Err(_) = self.channel.set(py, send) {
             panic!("Printer was already started!");
         }
-
-        let (send, recv) = mpsc::channel();
 
         let handle = thread::spawn(move || -> PyResult<()> {
             let mut printer = InnerPrinter::new(mode, recv);
@@ -238,8 +237,7 @@ impl Printer {
             Ok(())
         });
 
-        self.handle = Some(handle);
-        self.channel = Some(send);
+        self.handle.set(py, handle).unwrap();
     }
 
     pub fn stop(&mut self) -> PyResult<()> {
@@ -248,7 +246,7 @@ impl Printer {
         _ = self.channel.take();
         if let Some(handle) = self.handle.take() {
             if let Err(e) = handle.join() {
-                // PyErr is statically guaranteed as the return type, so we can blindly
+                // PyErr is guaranteed as the return type, so we can blindly
                 // downcast
                 return Err(*e.downcast::<PyErr>().unwrap());
             }
@@ -258,8 +256,9 @@ impl Printer {
     }
 
     /// Send a message to the InnerPrinter for displaying
-    pub fn send(&self, msg: Message) -> PyResult<()> {
-        match self.channel.as_ref() {
+    #[pyo3(signature = (msg))]
+    pub fn send(&self, py: Python<'_>, msg: Message) -> PyResult<()> {
+        match self.channel.get(py) {
             Some(chan) => chan.send(msg).unwrap(),
             None => panic!("Receiver closed early?"),
         }
