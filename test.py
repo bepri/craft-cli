@@ -1,7 +1,10 @@
-from craft_cli.printer import Mode, Printer
+"""Just some tests."""
+
 from time import sleep
 
-printer = Printer(Mode.VERBOSE)
+from craft_cli.printer import Mode, Printer
+
+printer = Printer(Mode.BRIEF)
 
 printer.progress("starting", permanent=False)
 sleep(5)

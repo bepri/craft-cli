@@ -1,15 +1,10 @@
 use std::{
-    io::{self, StderrLock, StdoutLock, Write},
     sync::mpsc::{self, RecvTimeoutError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use pyo3::{pyclass, pymethods, pymodule, sync::GILOnceCell, PyErr, PyResult, Python};
-
-const ANSI_CLEAR_LINE_TO_END: &str = "\u{001b}[K";
-const ANSI_HIDE_CURSOR: &str = "\u{001b}[?25l";
-const ANSI_SHOW_CURSOR: &str = "\u{001b}[?25h";
 
 /// Types of message for printing.
 #[non_exhaustive]
@@ -55,24 +50,26 @@ pub enum Mode {
 ///
 /// Holds an exclusive lock over stdout and stderr and frees it only
 /// upon being dropped.
-struct InnerPrinter<'locks> {
+struct InnerPrinter {
     channel: mpsc::Receiver<Message>,
-    stdout: StdoutLock<'locks>,
-    stderr: StderrLock<'locks>,
+    stdout: console::Term,
+    stderr: console::Term,
     mode: Mode,
+    overwrite: Option<console::TermTarget>,
 }
 
-impl<'locks> InnerPrinter<'locks> {
+impl InnerPrinter {
     pub fn new(mode: Mode, channel: mpsc::Receiver<Message>) -> Self {
-        let mut result = Self {
-            stdout: io::stdout().lock(),
-            stderr: io::stderr().lock(),
+        let result = Self {
+            stdout: console::Term::stdout(),
+            stderr: console::Term::stderr(),
             channel,
             mode,
+            overwrite: None,
         };
 
         // Hide the terminal cursor while taking control
-        result.print(ANSI_HIDE_CURSOR.into()).unwrap();
+        result.stdout.hide_cursor().unwrap();
 
         result
     }
@@ -160,49 +157,49 @@ impl<'locks> InnerPrinter<'locks> {
         }
     }
 
+    fn handle_overwrite(&mut self, new_val: Option<console::TermTarget>) -> PyResult<()> {
+        if let Some(target) = ::std::mem::replace(&mut self.overwrite, new_val) {
+            match target {
+                console::TermTarget::Stdout => self.stdout.clear_last_lines(1),
+                console::TermTarget::Stderr => self.stderr.clear_last_lines(1),
+                // The last variant is not used internally at all
+                console::TermTarget::ReadWritePair(_) => unreachable!(),
+            }?;
+        };
+        Ok(())
+    }
+
     /// Print a simple message to stdout.
     fn print(&mut self, message: String) -> PyResult<()> {
-        self.stdout.write(message.as_bytes())?;
-        self.stdout.flush()?;
+        self.stdout.write_line(&message)?;
         Ok(())
     }
 
     /// Print a simple message to stderr.
     fn error(&mut self, message: String) -> PyResult<()> {
-        self.stderr.write(message.as_bytes())?;
-        self.stderr.flush()?;
+        self.handle_overwrite(None)?;
+        self.stderr.write_line(&message)?;
         Ok(())
     }
 
     /// Print progress on a task.
     pub fn progress(&mut self, message: String, permanent: bool) -> PyResult<()> {
-        use self::Mode::*;
-
-        let ret_char = match self.mode {
-            BRIEF => match permanent {
-                true => "\n",
-                false => "\r",
+        self.handle_overwrite(match permanent {
+            true => None,
+            false => match self.mode {
+                Mode::BRIEF => console::TermTarget::Stdout.into(),
+                Mode::VERBOSE => None,
             },
-            VERBOSE => "\n",
-        };
-
-        let prepared_msg = format!(
-            "\r{}{}{}",
-            ANSI_CLEAR_LINE_TO_END,
-            message.trim_end(),
-            ret_char
-        );
-
-        self.print(prepared_msg)?;
-
+        })?;
+        self.print(message)?;
         Ok(())
     }
 }
 
-impl<'locks> Drop for InnerPrinter<'locks> {
+impl Drop for InnerPrinter {
     /// Restore the cursor when releasing control of the terminal.
     fn drop(&mut self) {
-        self.print(ANSI_SHOW_CURSOR.into()).unwrap();
+        self.stdout.show_cursor().unwrap();
     }
 }
 
