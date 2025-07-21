@@ -4,8 +4,9 @@ from time import sleep
 
 from craft_cli.printer import Mode, Printer
 
-printer = Printer(Mode.BRIEF)
+printer = Printer(Mode.VERBOSE)
 
+printer.progress("hey!", permanent=True)
 printer.progress("starting", permanent=False)
 sleep(5)
 printer.progress("processing", permanent=False)

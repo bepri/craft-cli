@@ -1,8 +1,10 @@
 use std::{
     sync::mpsc::{self, RecvTimeoutError},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use lazy_static::lazy_static;
 
 use pyo3::{pyclass, pymethods, pymodule, sync::GILOnceCell, PyErr, PyResult, Python};
 
@@ -10,7 +12,7 @@ use pyo3::{pyclass, pymethods, pymodule, sync::GILOnceCell, PyErr, PyResult, Pyt
 #[non_exhaustive]
 #[derive(Clone, Copy)]
 #[pyclass]
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types)]
 pub enum MessageType {
     PROG_PERSISTENT,
     PROG_EPHEMERAL,
@@ -37,6 +39,30 @@ impl Message {
     }
 }
 
+impl Message {
+    pub fn determine_stream(&self, mode: &Mode) -> Option<console::TermTarget> {
+        use self::{MessageType::*, Mode::*};
+        use console::TermTarget::*;
+        match self.model {
+            PROG_PERSISTENT | PROG_EPHEMERAL => Stdout.into(),
+            WARNING => Stderr.into(),
+            ERROR => Stderr.into(),
+            DEBUG => match mode {
+                VERBOSE => Stdout.into(),
+                BRIEF => None,
+            },
+            TRACE => match mode {
+                VERBOSE => Stdout.into(),
+                BRIEF => None,
+            },
+            INFO => match mode {
+                VERBOSE => Stdout.into(),
+                BRIEF => None,
+            },
+        }
+    }
+}
+
 /// Verbosity modes.
 #[non_exhaustive]
 #[derive(Clone)]
@@ -55,7 +81,7 @@ struct InnerPrinter {
     stdout: console::Term,
     stderr: console::Term,
     mode: Mode,
-    overwrite: Option<console::TermTarget>,
+    needs_overwrite: bool,
 }
 
 impl InnerPrinter {
@@ -65,7 +91,7 @@ impl InnerPrinter {
             stderr: console::Term::stderr(),
             channel,
             mode,
-            overwrite: None,
+            needs_overwrite: false,
         };
 
         // Hide the terminal cursor while taking control
@@ -81,14 +107,12 @@ impl InnerPrinter {
     /// this from a dedicated thread.
     pub fn listen(&mut self) -> PyResult<()> {
         let mut maybe_prv_msg: Option<Message> = None;
-        let mut time = Instant::now();
         'thread: loop {
             // Wait the standard 3 seconds for a message
             match self.await_message(Duration::from_secs(3)) {
                 Ok(msg) => {
                     // Store the most recently received message in case we need to
                     // begin displaying a spin loader
-                    time = Instant::now();
                     maybe_prv_msg = Some(msg.clone());
                     self.handle_message(msg)?
                 }
@@ -102,25 +126,46 @@ impl InnerPrinter {
                         None => continue,
                     };
 
-                    let mut spin_chars = ["⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"].iter().cycle();
+                    // Get the progress spinner style
+                    lazy_static! {
+                        static ref STYLE: indicatif::ProgressStyle =
+                            indicatif::ProgressStyle::with_template("{spinner} {msg} ({elapsed})")
+                                .unwrap();
+                    }
+
+                    use console::TermTarget::*;
+                    let spinner = prv_msg.determine_stream(&self.mode).map(|target| {
+                        let s = match target {
+                            Stdout => indicatif::ProgressBar::with_draw_target(
+                                None,
+                                indicatif::ProgressDrawTarget::stdout(),
+                            ),
+                            Stderr => indicatif::ProgressBar::with_draw_target(
+                                None,
+                                indicatif::ProgressDrawTarget::stderr(),
+                            ),
+                            // This variant is never used
+                            ReadWritePair(_) => unreachable!(),
+                        }
+                        .with_message(prv_msg.message.clone())
+                        .with_style(STYLE.clone());
+
+                        self.stdout.clear_last_lines(1).unwrap();
+                        s.enable_steady_tick(Duration::from_millis(100));
+                        s
+                    });
 
                     // Kick off another loop similar to the one above, but on a more
                     // frequent poll interval.
                     loop {
-                        // Print a copy of the previous message with a spinner and the
-                        // elapsed time
-                        let spin_message = format!(
-                            "{} {:.1} {}",
-                            prv_msg.message,
-                            (Instant::now() - time).as_secs_f32(),
-                            spin_chars.next().unwrap()
-                        );
-                        self.handle_message(Message::new(spin_message, prv_msg.model))?;
-
                         // Same logic as the outer match statement, but with a much more
                         // frequent check.
                         match self.await_message(Duration::from_millis(100)) {
                             Ok(msg) => {
+                                if let Some(s) = spinner {
+                                    s.finish_and_clear();
+                                    self.handle_message(prv_msg)?;
+                                }
                                 self.handle_message(msg)?;
                                 break;
                             }
@@ -148,49 +193,41 @@ impl InnerPrinter {
     fn handle_message(&mut self, msg: Message) -> PyResult<()> {
         use self::MessageType::*;
         match msg.model {
-            INFO => self.print(msg.message),
-            ERROR => self.error(msg.message),
-            PROG_EPHEMERAL | PROG_PERSISTENT => {
-                self.progress(msg.message, matches!(msg.model, PROG_PERSISTENT))
-            }
+            INFO => self.print(msg),
+            ERROR => self.error(msg),
+            PROG_EPHEMERAL => self.progress(msg, false),
+            PROG_PERSISTENT => self.progress(msg, true),
             _ => unimplemented!(),
         }
     }
 
-    fn handle_overwrite(&mut self, new_val: Option<console::TermTarget>) -> PyResult<()> {
-        if let Some(target) = ::std::mem::replace(&mut self.overwrite, new_val) {
-            match target {
-                console::TermTarget::Stdout => self.stdout.clear_last_lines(1),
-                console::TermTarget::Stderr => self.stderr.clear_last_lines(1),
-                // The last variant is not used internally at all
-                console::TermTarget::ReadWritePair(_) => unreachable!(),
-            }?;
-        };
+    fn handle_overwrite(&mut self) -> PyResult<()> {
+        if self.needs_overwrite {
+            self.stdout.clear_last_lines(1)?;
+        }
         Ok(())
     }
 
     /// Print a simple message to stdout.
-    fn print(&mut self, message: String) -> PyResult<()> {
-        self.stdout.write_line(&message)?;
+    fn print(&mut self, message: Message) -> PyResult<()> {
+        self.stdout.write_line(&message.message)?;
         Ok(())
     }
 
     /// Print a simple message to stderr.
-    fn error(&mut self, message: String) -> PyResult<()> {
-        self.handle_overwrite(None)?;
-        self.stderr.write_line(&message)?;
+    fn error(&mut self, message: Message) -> PyResult<()> {
+        self.handle_overwrite()?;
+        self.stderr.write_line(&message.message)?;
         Ok(())
     }
 
     /// Print progress on a task.
-    pub fn progress(&mut self, message: String, permanent: bool) -> PyResult<()> {
-        self.handle_overwrite(match permanent {
-            true => None,
-            false => match self.mode {
-                Mode::BRIEF => console::TermTarget::Stdout.into(),
-                Mode::VERBOSE => None,
-            },
-        })?;
+    pub fn progress(&mut self, message: Message, permanent: bool) -> PyResult<()> {
+        self.handle_overwrite()?;
+        self.needs_overwrite = match self.mode {
+            Mode::BRIEF => !permanent,
+            Mode::VERBOSE => false,
+        };
         self.print(message)?;
         Ok(())
     }
