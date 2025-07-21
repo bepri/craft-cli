@@ -7,7 +7,7 @@ use pyo3::{PyErr, PyTypeInfo, Python};
 use regex::Regex;
 
 pub fn assert_error_type<T: PyTypeInfo>(err: &PyErr) {
-    Python::with_gil(|py| assert!(err.is_instance_of::<T>(py)))
+    Python::with_gil(|py| assert!(err.is_instance_of::<T>(py)));
 }
 
 pub fn assert_error_contents<R>(err: &PyErr, r#match: R)
@@ -21,8 +21,8 @@ where
 
     Python::with_gil(|py| {
         let value = err.value(py).to_string();
-        assert!(re.is_match(&value))
-    })
+        assert!(re.is_match(&value));
+    });
 }
 
 #[cfg(test)]

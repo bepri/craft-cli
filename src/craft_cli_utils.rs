@@ -1,8 +1,8 @@
-//! Utility functions for craft_cli
+//! Utility functions for Craft CLI
 
 use pyo3::pymodule;
 
-/// Utility functions for craft_cli
+/// Utility functions for Craft CLI
 #[pymodule(submodule)]
 #[pyo3(module = "craft_cli._rs.utils")]
 pub mod utils {
@@ -29,6 +29,7 @@ pub mod utils {
         )
     }
 
+    /// Fix syspath for easier importing in Python.
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
         fix_imports(m, "craft_cli._rs.utils")

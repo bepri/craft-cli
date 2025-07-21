@@ -22,7 +22,6 @@ pyo3 = "0.24.0"
 [dependencies]
 console = "0.16.0"
 indicatif = { version = "0.18.0", features = ["improved_unicode"] }
-lazy_static = "1.5.0"
 pyo3 = { workspace = true }
 regex = "1.11.1"
 termsize = "0.1.9"

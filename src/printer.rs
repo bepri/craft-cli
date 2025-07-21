@@ -1,38 +1,60 @@
+//! The `Printer` module for handling messages to a terminal.
+
 use std::{
     sync::mpsc::{self, RecvTimeoutError},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use lazy_static::lazy_static;
-
 use pyo3::{pyclass, pymethods, pymodule, sync::GILOnceCell, PyErr, PyResult, Python};
+
+use console::TermTarget;
 
 /// Types of message for printing.
 #[non_exhaustive]
 #[derive(Clone, Copy)]
 #[pyclass]
-#[expect(non_camel_case_types)]
 pub enum MessageType {
-    PROG_PERSISTENT,
-    PROG_EPHEMERAL,
-    WARNING,
-    ERROR,
-    DEBUG,
-    TRACE,
-    INFO,
+    /// A persistent progress message that will remain on the console.
+    ///
+    /// For a non-permanent message, see `ProgEphemeral`.
+    ProgPersistent,
+
+    /// An ephemeral progress message that will be overwritten by the next message.
+    ///
+    /// For a permanent message, see `ProgPersistent`.
+    ProgEphemeral,
+
+    /// A warning message.
+    Warning,
+
+    /// An error message.
+    Error,
+
+    /// A debugging info message.
+    Debug,
+
+    /// A trace info message.
+    Trace,
+
+    /// An informational message.
+    Info,
 }
 
 /// A single message to be sent, and what type of message it is.
 #[derive(Clone)]
 #[pyclass]
 pub struct Message {
+    /// The message to be printed.
     message: String,
+
+    /// The type of message to send.
     model: MessageType,
 }
 
 #[pymethods]
 impl Message {
+    /// The `__init__` function in Python for a new message object.
     #[new]
     pub fn new(message: String, model: MessageType) -> Self {
         Self { message, model }
@@ -40,24 +62,16 @@ impl Message {
 }
 
 impl Message {
-    pub fn determine_stream(&self, mode: &Mode) -> Option<console::TermTarget> {
+    /// Calculate which stream a message should go to based on its model.
+    pub fn determine_stream(&self, mode: &Mode) -> Option<TermTarget> {
         use self::{MessageType::*, Mode::*};
-        use console::TermTarget::*;
+        use TermTarget::*;
         match self.model {
-            PROG_PERSISTENT | PROG_EPHEMERAL => Stdout.into(),
-            WARNING => Stderr.into(),
-            ERROR => Stderr.into(),
-            DEBUG => match mode {
-                VERBOSE => Stdout.into(),
-                BRIEF => None,
-            },
-            TRACE => match mode {
-                VERBOSE => Stdout.into(),
-                BRIEF => None,
-            },
-            INFO => match mode {
-                VERBOSE => Stdout.into(),
-                BRIEF => None,
+            ProgPersistent | ProgEphemeral => Stdout.into(),
+            Warning | Error => Stderr.into(),
+            Debug | Trace | Info => match mode {
+                Verbose => Stdout.into(),
+                Brief => None,
             },
         }
     }
@@ -68,23 +82,39 @@ impl Message {
 #[derive(Clone)]
 #[pyclass]
 pub enum Mode {
-    BRIEF,
-    VERBOSE,
+    /// Brief output. Most messages should be ephemeral and all debugging-style message
+    /// models should be skipped.
+    Brief,
+
+    /// Verbose mode. All messages should be persistent and all debugging-style messages
+    /// kept.
+    Verbose,
 }
 
 /// An internal printer object meant to print from a separate thread.
-///
-/// Holds an exclusive lock over stdout and stderr and frees it only
-/// upon being dropped.
 struct InnerPrinter {
+    /// A channel upon which messages can be read.
+    ///
+    /// If this channel is found to be closed, the program is over and this struct
+    /// should begin to destruct itself.
     channel: mpsc::Receiver<Message>,
+
+    /// A handle on stdout.
     stdout: console::Term,
+
+    /// A handle on stderr.
     stderr: console::Term,
+
+    /// Printing verbosity mode.
     mode: Mode,
+
+    /// A flag indicating if the previous line should be overwritten when printing
+    /// the next.
     needs_overwrite: bool,
 }
 
 impl InnerPrinter {
+    /// Instantiate a new `InnerPrinter`.
     pub fn new(mode: Mode, channel: mpsc::Receiver<Message>) -> Self {
         let result = Self {
             stdout: console::Term::stdout(),
@@ -114,7 +144,7 @@ impl InnerPrinter {
                     // Store the most recently received message in case we need to
                     // begin displaying a spin loader
                     maybe_prv_msg = Some(msg.clone());
-                    self.handle_message(msg)?
+                    self.handle_message(&msg)?;
                 }
                 // Break out of this loop if the channel is closed
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -127,25 +157,25 @@ impl InnerPrinter {
                     };
 
                     // Get the progress spinner style
-                    lazy_static! {
-                        static ref STYLE: indicatif::ProgressStyle =
+                    #[expect(clippy::items_after_statements)]
+                    static STYLE: std::sync::LazyLock<indicatif::ProgressStyle> =
+                        std::sync::LazyLock::new(|| {
                             indicatif::ProgressStyle::with_template("{spinner} {msg} ({elapsed})")
-                                .unwrap();
-                    }
+                                .unwrap()
+                        });
 
-                    use console::TermTarget::*;
                     let spinner = prv_msg.determine_stream(&self.mode).map(|target| {
                         let s = match target {
-                            Stdout => indicatif::ProgressBar::with_draw_target(
+                            TermTarget::Stdout => indicatif::ProgressBar::with_draw_target(
                                 None,
                                 indicatif::ProgressDrawTarget::stdout(),
                             ),
-                            Stderr => indicatif::ProgressBar::with_draw_target(
+                            TermTarget::Stderr => indicatif::ProgressBar::with_draw_target(
                                 None,
                                 indicatif::ProgressDrawTarget::stderr(),
                             ),
                             // This variant is never used
-                            ReadWritePair(_) => unreachable!(),
+                            TermTarget::ReadWritePair(_) => unreachable!(),
                         }
                         .with_message(prv_msg.message.clone())
                         .with_style(STYLE.clone());
@@ -164,13 +194,13 @@ impl InnerPrinter {
                             Ok(msg) => {
                                 if let Some(s) = spinner {
                                     s.finish_and_clear();
-                                    self.handle_message(prv_msg)?;
+                                    self.handle_message(&prv_msg)?;
                                 }
-                                self.handle_message(msg)?;
+                                self.handle_message(&msg)?;
                                 break;
                             }
                             Err(RecvTimeoutError::Disconnected) => break 'thread,
-                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Timeout) => (),
                         }
                     }
                 }
@@ -190,17 +220,18 @@ impl InnerPrinter {
 
     /// Routing method for sending a message to the proper printing logic for a given
     /// message type.
-    fn handle_message(&mut self, msg: Message) -> PyResult<()> {
+    fn handle_message(&mut self, msg: &Message) -> PyResult<()> {
         use self::MessageType::*;
         match msg.model {
-            INFO => self.print(msg),
-            ERROR => self.error(msg),
-            PROG_EPHEMERAL => self.progress(msg, false),
-            PROG_PERSISTENT => self.progress(msg, true),
+            Info => self.print(msg),
+            Error => self.error(msg),
+            ProgEphemeral => self.progress(msg, false),
+            ProgPersistent => self.progress(msg, true),
             _ => unimplemented!(),
         }
     }
 
+    /// Handle the need (or lackthereof) to overwrite the previous line.
     fn handle_overwrite(&mut self) -> PyResult<()> {
         if self.needs_overwrite {
             self.stdout.clear_last_lines(1)?;
@@ -209,24 +240,24 @@ impl InnerPrinter {
     }
 
     /// Print a simple message to stdout.
-    fn print(&mut self, message: Message) -> PyResult<()> {
+    fn print(&mut self, message: &Message) -> PyResult<()> {
         self.stdout.write_line(&message.message)?;
         Ok(())
     }
 
     /// Print a simple message to stderr.
-    fn error(&mut self, message: Message) -> PyResult<()> {
+    fn error(&mut self, message: &Message) -> PyResult<()> {
         self.handle_overwrite()?;
         self.stderr.write_line(&message.message)?;
         Ok(())
     }
 
     /// Print progress on a task.
-    pub fn progress(&mut self, message: Message, permanent: bool) -> PyResult<()> {
+    pub fn progress(&mut self, message: &Message, permanent: bool) -> PyResult<()> {
         self.handle_overwrite()?;
         self.needs_overwrite = match self.mode {
-            Mode::BRIEF => !permanent,
-            Mode::VERBOSE => false,
+            Mode::Brief => !permanent,
+            Mode::Verbose => false,
         };
         self.print(message)?;
         Ok(())
@@ -245,12 +276,16 @@ impl Drop for InnerPrinter {
 #[derive(Default)]
 #[pyclass]
 pub struct Printer {
+    /// A handle on the thread running the `InnerPrinter` instance.
     handle: GILOnceCell<JoinHandle<PyResult<()>>>,
+
+    /// A channel to send messages to the `InnerPrinter` instance.
     channel: GILOnceCell<mpsc::Sender<Message>>,
 }
 
 #[pymethods]
 impl Printer {
+    /// The `__init__` Python method to create a printer.
     #[new]
     pub fn new() -> Self {
         Self::default()
@@ -261,9 +296,10 @@ impl Printer {
     pub fn start(&mut self, py: Python<'_>, mode: Mode) {
         let (send, recv) = mpsc::channel();
 
-        if let Err(_) = self.channel.set(py, send) {
-            panic!("Printer was already started!");
-        }
+        assert!(
+            self.channel.set(py, send).is_ok(),
+            "Printer was already started!"
+        );
 
         let handle = thread::spawn(move || -> PyResult<()> {
             let mut printer = InnerPrinter::new(mode, recv);
@@ -274,6 +310,9 @@ impl Printer {
         self.handle.set(py, handle).unwrap();
     }
 
+    /// Stop printing.
+    ///
+    /// This ends the `InnerPrinter` instance's thread.
     pub fn stop(&mut self) -> PyResult<()> {
         // Dropping the channel closes it, which will be seen by the other thread as a
         // stopping condition
@@ -291,13 +330,11 @@ impl Printer {
 
     /// Send a message to the InnerPrinter for displaying
     #[pyo3(signature = (msg))]
-    pub fn send(&self, py: Python<'_>, msg: Message) -> PyResult<()> {
+    pub fn send(&self, py: Python<'_>, msg: Message) {
         match self.channel.get(py) {
             Some(chan) => chan.send(msg).unwrap(),
             None => panic!("Receiver closed early?"),
         }
-
-        Ok(())
     }
 }
 
@@ -311,6 +348,7 @@ pub mod printer {
     #[pymodule_export]
     use super::{Message, MessageType, Mode, Printer};
 
+    /// Fix syspath for easier importing in Python.
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
         fix_imports(m, "craft_cli._rs.printer")
