@@ -23,9 +23,7 @@ pyo3 = "0.24.0"
 console = "0.16.0"
 indicatif = { version = "0.18.0", features = ["improved_unicode"] }
 pyo3 = { workspace = true }
-regex = "1.11.1"
-termsize = "0.1.9"
 
 [dev-dependencies]
 pyo3 = { features = ["auto-initialize"], workspace = true }
-tempdir = "0.3.7"
+regex = "1.11.1"
