@@ -1,7 +1,10 @@
 //! The `Printer` module for handling messages to a terminal.
 
 use std::{
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::{
+        mpsc::{self, RecvTimeoutError},
+        LazyLock,
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -9,6 +12,8 @@ use std::{
 use pyo3::{pyclass, pymethods, pymodule, sync::GILOnceCell, PyErr, PyResult, Python};
 
 use console::TermTarget;
+
+use crate::utils::log;
 
 /// Types of message for printing.
 #[non_exhaustive]
@@ -136,11 +141,30 @@ impl InnerPrinter {
     /// `self.channel` is closed. As such, it is strongly recommended to only invoke
     /// this from a dedicated thread.
     pub fn listen(&mut self) -> PyResult<()> {
+        static MAIN_STYLE: LazyLock<indicatif::ProgressStyle> = LazyLock::new(|| {
+            indicatif::ProgressStyle::with_template("{spinner} {msg} ({elapsed})").unwrap()
+        });
+        let mut spinner: Option<indicatif::ProgressBar> = None;
+
         let mut maybe_prv_msg: Option<Message> = None;
-        'thread: loop {
+
+        loop {
             // Wait the standard 3 seconds for a message
             match self.await_message(Duration::from_secs(3)) {
                 Ok(msg) => {
+                    // If we were spinning, stop
+                    if let Some(s) = spinner.take() {
+                        let mut prv_msg = match maybe_prv_msg {
+                            Some(_) => maybe_prv_msg.take().unwrap(),
+                            None => continue,
+                        };
+                        s.finish_and_clear();
+                        self.needs_overwrite = false;
+                        let dur = indicatif::HumanDuration(s.elapsed());
+                        prv_msg.message = format!("{} (took {:#})", prv_msg.message, dur);
+                        self.handle_message(&prv_msg)?;
+                        log(format!("clearing {}", prv_msg.message));
+                    }
                     // Store the most recently received message in case we need to
                     // begin displaying a spin loader
                     maybe_prv_msg = Some(msg.clone());
@@ -151,58 +175,38 @@ impl InnerPrinter {
                 // If the three seconds elapsed, spin
                 Err(RecvTimeoutError::Timeout) => {
                     // Don't actually spin if there isn't a previous message to spin on
-                    let prv_msg = match maybe_prv_msg {
-                        Some(_) => maybe_prv_msg.take().unwrap(),
-                        None => continue,
-                    };
-
-                    // Get the progress spinner style
-                    #[expect(clippy::items_after_statements)]
-                    static STYLE: std::sync::LazyLock<indicatif::ProgressStyle> =
-                        std::sync::LazyLock::new(|| {
-                            indicatif::ProgressStyle::with_template("{spinner} {msg} ({elapsed})")
-                                .unwrap()
-                        });
-
-                    let spinner = prv_msg.determine_stream(&self.mode).map(|target| {
-                        let s = match target {
-                            TermTarget::Stdout => indicatif::ProgressBar::with_draw_target(
-                                None,
-                                indicatif::ProgressDrawTarget::stdout(),
-                            ),
-                            TermTarget::Stderr => indicatif::ProgressBar::with_draw_target(
-                                None,
-                                indicatif::ProgressDrawTarget::stderr(),
-                            ),
-                            // This variant is never used
-                            TermTarget::ReadWritePair(_) => unreachable!(),
-                        }
-                        .with_message(prv_msg.message.clone())
-                        .with_style(STYLE.clone());
-
-                        self.stdout.clear_last_lines(1).unwrap();
-                        s.enable_steady_tick(Duration::from_millis(100));
-                        s
-                    });
-
-                    // Kick off another loop similar to the one above, but on a more
-                    // frequent poll interval.
-                    loop {
-                        // Same logic as the outer match statement, but with a much more
-                        // frequent check.
-                        match self.await_message(Duration::from_millis(100)) {
-                            Ok(msg) => {
-                                if let Some(s) = spinner {
-                                    s.finish_and_clear();
-                                    self.handle_message(&prv_msg)?;
-                                }
-                                self.handle_message(&msg)?;
-                                break;
-                            }
-                            Err(RecvTimeoutError::Disconnected) => break 'thread,
-                            Err(RecvTimeoutError::Timeout) => (),
-                        }
+                    if spinner.is_some() {
+                        continue;
                     }
+                    spinner = maybe_prv_msg.take().and_then(|prv_msg| {
+                        match prv_msg.determine_stream(&self.mode) {
+                            Some(target) => {
+                                let s = match target {
+                                    TermTarget::Stdout => indicatif::ProgressBar::with_draw_target(
+                                        None,
+                                        indicatif::ProgressDrawTarget::stdout(),
+                                    ),
+                                    TermTarget::Stderr => indicatif::ProgressBar::with_draw_target(
+                                        None,
+                                        indicatif::ProgressDrawTarget::stderr(),
+                                    ),
+                                    // This variant is never used
+                                    TermTarget::ReadWritePair(_) => unreachable!(),
+                                }
+                                .with_message(prv_msg.message.clone())
+                                .with_style(MAIN_STYLE.clone())
+                                .with_elapsed(Duration::from_secs(3));
+
+                                // It doesn't matter which stream we clear, the line we're about to
+                                // spin is wiped either way
+                                self.stdout.clear_last_lines(1).unwrap();
+                                s.enable_steady_tick(Duration::from_millis(100));
+                                log(format!("spinning on {}", prv_msg.message));
+                                s.into()
+                            }
+                            None => None,
+                        }
+                    });
                 }
             }
         }
@@ -234,6 +238,7 @@ impl InnerPrinter {
     /// Handle the need (or lackthereof) to overwrite the previous line.
     fn handle_overwrite(&mut self) -> PyResult<()> {
         if self.needs_overwrite {
+            log("overwriting!");
             self.stdout.clear_last_lines(1)?;
         }
         Ok(())
@@ -254,11 +259,9 @@ impl InnerPrinter {
 
     /// Print progress on a task.
     pub fn progress(&mut self, message: &Message, permanent: bool) -> PyResult<()> {
+        log(format!("writing {}", message.message));
         self.handle_overwrite()?;
-        self.needs_overwrite = match self.mode {
-            Mode::Brief => !permanent,
-            Mode::Verbose => false,
-        };
+        self.needs_overwrite = !permanent;
         self.print(message)?;
         Ok(())
     }
@@ -267,6 +270,7 @@ impl InnerPrinter {
 impl Drop for InnerPrinter {
     /// Restore the cursor when releasing control of the terminal.
     fn drop(&mut self) {
+        self.handle_overwrite().unwrap();
         self.stdout.show_cursor().unwrap();
     }
 }
