@@ -1,8 +1,8 @@
 //! Internal utils for Craft CLI.
 
 use pyo3::{
-    types::{PyAnyMethods, PyModule},
     Bound, PyResult, Python,
+    types::{PyAnyMethods, PyModule},
 };
 
 /// Hack: workaround for [an upstream issue in PyO3](https://github.com/PyO3/pyo3/issues/759)
@@ -11,7 +11,6 @@ pub fn fix_imports(m: &Bound<'_, PyModule>, name: &str) -> PyResult<()> {
 }
 
 /// Log a message for debugging purposes only.
-#[inline]
 pub fn log(message: impl Into<String>) {
     #[cfg(debug_assertions)]
     {

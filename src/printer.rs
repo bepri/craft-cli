@@ -2,22 +2,35 @@
 
 use std::{
     sync::{
+        LazyLock, OnceLock,
         mpsc::{self, RecvTimeoutError},
-        LazyLock,
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use pyo3::{pyclass, pymethods, pymodule, sync::GILOnceCell, PyErr, PyResult, Python};
+use pyo3::{PyErr, PyResult, pyclass};
 
 use console::TermTarget;
 
 use crate::utils::log;
 
+/// Representation of which stream should be targeted by a message.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// Target the stdout stream.
+    Stdout,
+
+    /// Target the stderr stream.
+    Stderr,
+
+    /// Target no stream at all.
+    Null,
+}
+
 /// Types of message for printing.
 #[non_exhaustive]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[pyclass]
 pub enum MessageType {
     /// A persistent progress message that will remain on the console.
@@ -47,36 +60,29 @@ pub enum MessageType {
 }
 
 /// A single message to be sent, and what type of message it is.
-#[derive(Clone)]
-#[pyclass]
+#[derive(Clone, Debug)]
 pub struct Message {
     /// The message to be printed.
-    message: String,
+    pub(crate) text: String,
 
     /// The type of message to send.
-    model: MessageType,
-}
+    pub(crate) model: MessageType,
 
-#[pymethods]
-impl Message {
-    /// The `__init__` function in Python for a new message object.
-    #[new]
-    pub fn new(message: String, model: MessageType) -> Self {
-        Self { message, model }
-    }
+    /// Where the message should be sent.
+    pub(crate) target: Target,
 }
 
 impl Message {
     /// Calculate which stream a message should go to based on its model.
-    pub fn determine_stream(&self, mode: &Mode) -> Option<TermTarget> {
-        use self::{MessageType::*, Mode::*};
+    pub fn determine_stream(&self, mode: Verbosity) -> Option<TermTarget> {
+        use self::Verbosity::*;
         use TermTarget::*;
         match self.model {
-            ProgPersistent | ProgEphemeral => Stdout.into(),
-            Warning | Error => Stderr.into(),
-            Debug | Trace | Info => match mode {
+            MessageType::ProgPersistent | MessageType::ProgEphemeral => Stdout.into(),
+            MessageType::Warning | MessageType::Error => Stderr.into(),
+            MessageType::Debug | MessageType::Trace | MessageType::Info => match mode {
                 Verbose => Stdout.into(),
-                Brief => None,
+                _ => None,
             },
         }
     }
@@ -84,9 +90,12 @@ impl Message {
 
 /// Verbosity modes.
 #[non_exhaustive]
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 #[pyclass]
-pub enum Mode {
+pub enum Verbosity {
+    /// Quiet output. Most messages should not be output at all.
+    Quiet,
+
     /// Brief output. Most messages should be ephemeral and all debugging-style message
     /// models should be skipped.
     Brief,
@@ -94,6 +103,9 @@ pub enum Mode {
     /// Verbose mode. All messages should be persistent and all debugging-style messages
     /// kept.
     Verbose,
+
+    /// Trace mode. The absolute maximum amount of information should be printed.
+    Trace,
 }
 
 /// An internal printer object meant to print from a separate thread.
@@ -111,7 +123,7 @@ struct InnerPrinter {
     stderr: console::Term,
 
     /// Printing verbosity mode.
-    mode: Mode,
+    mode: Verbosity,
 
     /// A flag indicating if the previous line should be overwritten when printing
     /// the next.
@@ -120,7 +132,7 @@ struct InnerPrinter {
 
 impl InnerPrinter {
     /// Instantiate a new `InnerPrinter`.
-    pub fn new(mode: Mode, channel: mpsc::Receiver<Message>) -> Self {
+    pub fn new(mode: Verbosity, channel: mpsc::Receiver<Message>) -> Self {
         let result = Self {
             stdout: console::Term::stdout(),
             stderr: console::Term::stderr(),
@@ -153,17 +165,15 @@ impl InnerPrinter {
             match self.await_message(Duration::from_secs(3)) {
                 Ok(msg) => {
                     // If we were spinning, stop
-                    if let Some(s) = spinner.take() {
-                        let mut prv_msg = match maybe_prv_msg {
-                            Some(_) => maybe_prv_msg.take().unwrap(),
-                            None => continue,
-                        };
+                    if let Some(s) = spinner.take()
+                        && let Some(mut prv_msg) = maybe_prv_msg.take()
+                    {
                         s.finish_and_clear();
                         self.needs_overwrite = false;
                         let dur = indicatif::HumanDuration(s.elapsed());
-                        prv_msg.message = format!("{} (took {:#})", prv_msg.message, dur);
+                        prv_msg.text = format!("{} (took {:#})", prv_msg.text, dur);
                         self.handle_message(&prv_msg)?;
-                        log(format!("clearing {}", prv_msg.message));
+                        log(format!("clearing {}", prv_msg.text));
                     }
                     // Store the most recently received message in case we need to
                     // begin displaying a spin loader
@@ -174,38 +184,39 @@ impl InnerPrinter {
                 Err(RecvTimeoutError::Disconnected) => break,
                 // If the three seconds elapsed, spin
                 Err(RecvTimeoutError::Timeout) => {
-                    // Don't actually spin if there isn't a previous message to spin on
+                    // If we're already spinning on a message, keep waiting
                     if spinner.is_some() {
                         continue;
                     }
-                    spinner = maybe_prv_msg.take().and_then(|prv_msg| {
-                        match prv_msg.determine_stream(&self.mode) {
-                            Some(target) => {
-                                let s = match target {
-                                    TermTarget::Stdout => indicatif::ProgressBar::with_draw_target(
-                                        None,
-                                        indicatif::ProgressDrawTarget::stdout(),
-                                    ),
-                                    TermTarget::Stderr => indicatif::ProgressBar::with_draw_target(
-                                        None,
-                                        indicatif::ProgressDrawTarget::stderr(),
-                                    ),
-                                    // This variant is never used
-                                    TermTarget::ReadWritePair(_) => unreachable!(),
-                                }
-                                .with_message(prv_msg.message.clone())
-                                .with_style(MAIN_STYLE.clone())
-                                .with_elapsed(Duration::from_secs(3));
-
-                                // It doesn't matter which stream we clear, the line we're about to
-                                // spin is wiped either way
-                                self.stdout.clear_last_lines(1).unwrap();
-                                s.enable_steady_tick(Duration::from_millis(100));
-                                log(format!("spinning on {}", prv_msg.message));
-                                s.into()
+                    // If there's a previous message to spin on, then,
+                    spinner = maybe_prv_msg.as_ref().and_then(|prv_msg| {
+                        // If there is a stream to print to,
+                        prv_msg.determine_stream(self.mode).map(|target| {
+                            // Construct a spinner
+                            let s = match target {
+                                TermTarget::Stdout => indicatif::ProgressBar::with_draw_target(
+                                    None,
+                                    indicatif::ProgressDrawTarget::stdout(),
+                                ),
+                                TermTarget::Stderr => indicatif::ProgressBar::with_draw_target(
+                                    None,
+                                    indicatif::ProgressDrawTarget::stderr(),
+                                ),
+                                // This variant is never used
+                                TermTarget::ReadWritePair(_) => unreachable!(),
                             }
-                            None => None,
-                        }
+                            .with_message(prv_msg.text.clone())
+                            .with_style(MAIN_STYLE.clone())
+                            .with_elapsed(Duration::from_secs(3));
+
+                            // It doesn't matter which stream we clear, the line we're about to
+                            // spin is wiped either way
+                            self.stdout.clear_last_lines(1).unwrap();
+                            // Start spinning
+                            s.enable_steady_tick(Duration::from_millis(100));
+                            log(format!("spinning on {}", prv_msg.text));
+                            s
+                        })
                     });
                 }
             }
@@ -226,6 +237,10 @@ impl InnerPrinter {
     /// message type.
     fn handle_message(&mut self, msg: &Message) -> PyResult<()> {
         use self::MessageType::*;
+        if let Target::Null = msg.target {
+            return Ok(());
+        }
+        log(format!("writing {msg:?}"));
         match msg.model {
             Info => self.print(msg),
             Error => self.error(msg),
@@ -246,20 +261,19 @@ impl InnerPrinter {
 
     /// Print a simple message to stdout.
     fn print(&mut self, message: &Message) -> PyResult<()> {
-        self.stdout.write_line(&message.message)?;
+        self.stdout.write_line(&message.text)?;
         Ok(())
     }
 
     /// Print a simple message to stderr.
     fn error(&mut self, message: &Message) -> PyResult<()> {
         self.handle_overwrite()?;
-        self.stderr.write_line(&message.message)?;
+        self.stderr.write_line(&message.text)?;
         Ok(())
     }
 
     /// Print progress on a task.
     pub fn progress(&mut self, message: &Message, permanent: bool) -> PyResult<()> {
-        log(format!("writing {}", message.message));
         self.handle_overwrite()?;
         self.needs_overwrite = !permanent;
         self.print(message)?;
@@ -278,30 +292,26 @@ impl Drop for InnerPrinter {
 /// Public API for printing. Stores a handle to the thread that `InnerPrinter` is
 /// printing from, and a channel to send messages.
 #[derive(Default)]
-#[pyclass]
 pub struct Printer {
     /// A handle on the thread running the `InnerPrinter` instance.
-    handle: GILOnceCell<JoinHandle<PyResult<()>>>,
+    handle: OnceLock<JoinHandle<PyResult<()>>>,
 
     /// A channel to send messages to the `InnerPrinter` instance.
-    channel: GILOnceCell<mpsc::Sender<Message>>,
+    channel: OnceLock<mpsc::Sender<Message>>,
 }
 
-#[pymethods]
 impl Printer {
     /// The `__init__` Python method to create a printer.
-    #[new]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Spawn a thread to begin listening for messages to print.
-    #[pyo3(signature = (mode))]
-    pub fn start(&mut self, py: Python<'_>, mode: Mode) {
+    pub fn start(&mut self, mode: Verbosity) {
         let (send, recv) = mpsc::channel();
 
         assert!(
-            self.channel.set(py, send).is_ok(),
+            self.channel.set(send).is_ok(),
             "Printer was already started!"
         );
 
@@ -311,7 +321,7 @@ impl Printer {
             Ok(())
         });
 
-        self.handle.set(py, handle).unwrap();
+        self.handle.set(handle).unwrap();
     }
 
     /// Stop printing.
@@ -332,29 +342,17 @@ impl Printer {
         Ok(())
     }
 
-    /// Send a message to the InnerPrinter for displaying
-    #[pyo3(signature = (msg))]
-    pub fn send(&self, py: Python<'_>, msg: Message) {
-        match self.channel.get(py) {
+    /// Send a message to the `InnerPrinter` for displaying
+    pub fn send(&self, msg: Message) {
+        match self.channel.get() {
             Some(chan) => chan.send(msg).unwrap(),
             None => panic!("Receiver closed early?"),
         }
     }
 }
 
-#[pymodule(submodule)]
-#[pyo3(module = "craft_cli._rs.printer")]
-pub mod printer {
-    use pyo3::{types::PyModule, Bound, PyResult};
-
-    use crate::utils::fix_imports;
-
-    #[pymodule_export]
-    use super::{Message, MessageType, Mode, Printer};
-
-    /// Fix syspath for easier importing in Python.
-    #[pymodule_init]
-    fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
-        fix_imports(m, "craft_cli._rs.printer")
+impl Drop for Printer {
+    fn drop(&mut self) {
+        self.stop().expect("An error was encountered while logging. Tear down the printer properly to view the error.");
     }
 }

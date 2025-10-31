@@ -17,6 +17,7 @@
 use pyo3::{prelude::*, pymodule};
 
 mod craft_cli_utils;
+mod emitter;
 mod printer;
 mod test_utils;
 mod utils;
@@ -30,9 +31,6 @@ mod _rs {
 
     #[pymodule_export]
     use crate::craft_cli_utils::utils;
-
-    #[pymodule_export]
-    use crate::printer::printer;
 
     /// Fix syspath for easier importing in Python.
     #[pymodule_init]
