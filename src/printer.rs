@@ -11,12 +11,9 @@ use std::{
 
 use pyo3::{PyErr, PyResult, pyclass};
 
-use console::TermTarget;
-
-use crate::utils::log;
-
 /// Representation of which stream should be targeted by a message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+#[pyclass]
 pub enum Target {
     /// Target the stdout stream.
     Stdout,
@@ -28,6 +25,16 @@ pub enum Target {
     Null,
 }
 
+impl From<Target> for indicatif::ProgressDrawTarget {
+    fn from(val: Target) -> Self {
+        match val {
+            Target::Stdout => indicatif::ProgressDrawTarget::stdout(),
+            Target::Stderr => indicatif::ProgressDrawTarget::stderr(),
+            Target::Null => indicatif::ProgressDrawTarget::hidden(),
+        }
+    }
+}
+
 /// Types of message for printing.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
@@ -36,27 +43,30 @@ pub enum MessageType {
     /// A persistent progress message that will remain on the console.
     ///
     /// For a non-permanent message, see `ProgEphemeral`.
-    ProgPersistent,
+    ProgPersistent(Target),
 
     /// An ephemeral progress message that will be overwritten by the next message.
     ///
     /// For a permanent message, see `ProgPersistent`.
-    ProgEphemeral,
+    ProgEphemeral(Target),
 
     /// A warning message.
-    Warning,
+    Warning(),
 
     /// An error message.
-    Error,
+    Error(),
 
     /// A debugging info message.
-    Debug,
+    Debug(),
 
     /// A trace info message.
-    Trace,
+    Trace(),
 
     /// An informational message.
-    Info,
+    Info(),
+
+    /// Signals to create a progress bar.
+    ProgBar(Target, u64),
 }
 
 /// A single message to be sent, and what type of message it is.
@@ -74,13 +84,15 @@ pub struct Message {
 
 impl Message {
     /// Calculate which stream a message should go to based on its model.
-    pub fn determine_stream(&self, mode: Verbosity) -> Option<TermTarget> {
+    pub fn determine_stream(&self, mode: Verbosity) -> Option<Target> {
+        use self::Target::*;
         use self::Verbosity::*;
-        use TermTarget::*;
         match self.model {
-            MessageType::ProgPersistent | MessageType::ProgEphemeral => Stdout.into(),
-            MessageType::Warning | MessageType::Error => Stderr.into(),
-            MessageType::Debug | MessageType::Trace | MessageType::Info => match mode {
+            MessageType::ProgPersistent(target)
+            | MessageType::ProgEphemeral(target)
+            | MessageType::ProgBar(target, ..) => target.into(),
+            MessageType::Warning() | MessageType::Error() => Stderr.into(),
+            MessageType::Debug() | MessageType::Trace() | MessageType::Info() => match mode {
                 Verbose => Stdout.into(),
                 _ => None,
             },
@@ -103,6 +115,10 @@ pub enum Verbosity {
     /// Verbose mode. All messages should be persistent and all debugging-style messages
     /// kept.
     Verbose,
+
+    /// Debug mode. Similar to trace mode, but slightly less information from external
+    /// loggers is kept.
+    Debug,
 
     /// Trace mode. The absolute maximum amount of information should be printed.
     Trace,
@@ -173,7 +189,6 @@ impl InnerPrinter {
                         let dur = indicatif::HumanDuration(s.elapsed());
                         prv_msg.text = format!("{} (took {:#})", prv_msg.text, dur);
                         self.handle_message(&prv_msg)?;
-                        log(format!("clearing {}", prv_msg.text));
                     }
                     // Store the most recently received message in case we need to
                     // begin displaying a spin loader
@@ -193,28 +208,16 @@ impl InnerPrinter {
                         // If there is a stream to print to,
                         prv_msg.determine_stream(self.mode).map(|target| {
                             // Construct a spinner
-                            let s = match target {
-                                TermTarget::Stdout => indicatif::ProgressBar::with_draw_target(
-                                    None,
-                                    indicatif::ProgressDrawTarget::stdout(),
-                                ),
-                                TermTarget::Stderr => indicatif::ProgressBar::with_draw_target(
-                                    None,
-                                    indicatif::ProgressDrawTarget::stderr(),
-                                ),
-                                // This variant is never used
-                                TermTarget::ReadWritePair(_) => unreachable!(),
-                            }
-                            .with_message(prv_msg.text.clone())
-                            .with_style(MAIN_STYLE.clone())
-                            .with_elapsed(Duration::from_secs(3));
+                            let s = indicatif::ProgressBar::with_draw_target(None, target.into())
+                                .with_message(prv_msg.text.clone())
+                                .with_style(MAIN_STYLE.clone())
+                                .with_elapsed(Duration::from_secs(3));
 
                             // It doesn't matter which stream we clear, the line we're about to
                             // spin is wiped either way
                             self.stdout.clear_last_lines(1).unwrap();
                             // Start spinning
                             s.enable_steady_tick(Duration::from_millis(100));
-                            log(format!("spinning on {}", prv_msg.text));
                             s
                         })
                     });
@@ -240,12 +243,11 @@ impl InnerPrinter {
         if let Target::Null = msg.target {
             return Ok(());
         }
-        log(format!("writing {msg:?}"));
         match msg.model {
-            Info => self.print(msg),
-            Error => self.error(msg),
-            ProgEphemeral => self.progress(msg, false),
-            ProgPersistent => self.progress(msg, true),
+            Info() => self.print(msg),
+            Error() => self.error(msg),
+            ProgEphemeral(..) => self.progress(msg, false),
+            ProgPersistent(..) => self.progress(msg, true),
             _ => unimplemented!(),
         }
     }
@@ -253,7 +255,6 @@ impl InnerPrinter {
     /// Handle the need (or lackthereof) to overwrite the previous line.
     fn handle_overwrite(&mut self) -> PyResult<()> {
         if self.needs_overwrite {
-            log("overwriting!");
             self.stdout.clear_last_lines(1)?;
         }
         Ok(())
@@ -273,11 +274,17 @@ impl InnerPrinter {
     }
 
     /// Print progress on a task.
-    pub fn progress(&mut self, message: &Message, permanent: bool) -> PyResult<()> {
+    fn progress(&mut self, message: &Message, permanent: bool) -> PyResult<()> {
         self.handle_overwrite()?;
         self.needs_overwrite = !permanent;
         self.print(message)?;
         Ok(())
+    }
+
+    #[expect(unused)]
+    /// Handle an incremental progress bar.
+    fn progress_bar(&mut self, message: &Message) -> PyResult<()> {
+        unimplemented!()
     }
 }
 
@@ -331,12 +338,12 @@ impl Printer {
         // Dropping the channel closes it, which will be seen by the other thread as a
         // stopping condition
         _ = self.channel.take();
-        if let Some(handle) = self.handle.take() {
-            if let Err(e) = handle.join() {
-                // PyErr is guaranteed as the return type, so we can blindly
-                // downcast
-                return Err(*e.downcast::<PyErr>().unwrap());
-            }
+        if let Some(handle) = self.handle.take()
+            && let Err(e) = handle.join()
+        {
+            // PyErr is guaranteed as the return type, so we can blindly
+            // downcast
+            return Err(*e.downcast::<PyErr>().unwrap());
         }
 
         Ok(())

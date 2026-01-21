@@ -10,6 +10,9 @@ pub fn fix_imports(m: &Bound<'_, PyModule>, name: &str) -> PyResult<()> {
     Python::with_gil(|py| py.import("sys")?.getattr("modules")?.set_item(name, m))
 }
 
+// This log function is very convenient for development, but may not necessarily always exist
+// in live code.
+#[allow(unused, clippy::allow_attributes)]
 /// Log a message for debugging purposes only.
 pub fn log(message: impl Into<String>) {
     #[cfg(debug_assertions)]

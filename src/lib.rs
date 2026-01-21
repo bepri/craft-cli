@@ -32,6 +32,9 @@ mod _rs {
     #[pymodule_export]
     use crate::craft_cli_utils::utils;
 
+    #[pymodule_export]
+    use crate::emitter::emitter;
+
     /// Fix syspath for easier importing in Python.
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
